@@ -7,7 +7,7 @@ import asyncio  # noqa: E402
 import tempfile  # noqa: E402
 from pathlib import Path  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
-from unittest.mock import Mock, patch  # noqa: E402
+from unittest.mock import AsyncMock, Mock, patch  # noqa: E402
 
 # Now safe to import plugin modules
 from nonebot_plugin_personal_companion.memory import MemoryStore  # noqa: E402
@@ -30,6 +30,7 @@ from nonebot_plugin_personal_companion.personality import BEIJING_TZ, build_syst
 from nonebot_plugin_personal_companion.proactive import ProactiveChat  # noqa: E402
 from nonebot_plugin_personal_companion.relationship import RelationshipProfiler, build_relationship_prompt  # noqa: E402
 from nonebot_plugin_personal_companion.llm_client import LLMClient  # noqa: E402
+from nonebot_plugin_personal_companion.web_search import SearchResult  # noqa: E402
 from nonebot_plugin_personal_companion.turn_context import (  # noqa: E402
     analyze_turn,
     build_companion_context_prompt,
@@ -1261,14 +1262,15 @@ def test_normal_chat_prompt_injects_timeline_entries_with_date_safety():
 def test_proactive_prompt_includes_timeline_as_background_only():
     store, db_path = make_store()
     try:
-        store.add_timeline_entry(1, "2026-04-22", "用户宣布自己已经拥有幸福了", event_time="17:14")
+        today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+        store.add_timeline_entry(1, today, "用户今天准备作品集", event_time="17:14", status="planned")
         config = Mock()
         chat = ProactiveChat(store, Mock(), config, kb=None)
 
         prompt = chat._build_proactive_prompt(user_id=1)
 
         assert "最近时间线背景" in prompt
-        assert "2026-04-22 17:14：用户宣布自己已经拥有幸福了" in prompt
+        assert f"{today} 17:14：用户今天准备作品集" in prompt
         assert "这些是历史时间线，不是今天的待办" in prompt
     finally:
         cleanup_store(store, db_path)
@@ -1427,6 +1429,229 @@ def test_personalized_knowledge_prompt():
 
         print(f"  [OK] Personalized knowledge: prompt length={len(prompt)} chars")
         print(f"       First 300 chars: {prompt[:300]}...")
+    finally:
+        cleanup_store(store, db_path)
+
+
+class ToolCallFunction:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class ToolCall:
+    def __init__(self, name, arguments, call_id="call_1"):
+        self.id = call_id
+        self.function = ToolCallFunction(name, arguments)
+
+
+class ToolChoice:
+    def __init__(self, content="", tool_calls=None, finish_reason="stop"):
+        self.message = Mock(content=content, tool_calls=tool_calls)
+        self.finish_reason = finish_reason
+
+
+class ToolResponse:
+    def __init__(self, content="", tool_calls=None, finish_reason="stop"):
+        self.choices = [ToolChoice(content, tool_calls, finish_reason)]
+
+
+def _make_tool_handler(store, llm, config=None, web_search=None):
+    from nonebot_plugin_personal_companion.message_handler import MessageHandler, MessageHandlerCallbacks
+    from nonebot_plugin_personal_companion.services import AppServices
+
+    config = config or Mock(
+        max_recent_messages=5,
+        web_search_enabled=True,
+        reminder_enabled=False,
+        summary_trigger_count=999,
+        feishu_timezone="Asia/Shanghai",
+    )
+    flow = Mock()
+    flow.detect_tool_request.return_value = None
+    flow.should_invite_process.return_value = False
+    flow.should_invite_appreciation.return_value = False
+    services = AppServices(
+        config=config,
+        memory=store,
+        llm=llm,
+        proactive_chat=Mock(),
+        knowledge_base=None,
+        manifestation_knowledge_base=None,
+        flow_manager=flow,
+        bili_fetcher=None,
+        diary_writer=None,
+        relationship_profiler=None,
+        feishu_calendar_client=None,
+        reminder_service=None,
+    )
+    callbacks = MessageHandlerCallbacks(
+        send_event_reply=AsyncMock(return_value=1),
+        handle_memory_command=Mock(return_value=None),
+        handle_manifestation_command=Mock(return_value=None),
+        maybe_extract_memories=AsyncMock(),
+        extract_keywords=Mock(return_value=[]),
+        retrieve_timeline_for_turn=Mock(return_value=[]),
+        handle_date_time_question=Mock(return_value=None),
+        llm_fallback=Mock(return_value="fallback"),
+        strip_outgoing_speaker_prefix=Mock(side_effect=lambda text: text),
+        maybe_snooze_proactive_for_user_message=Mock(),
+        build_messages=Mock(side_effect=lambda user_msg, *_: [{"role": "user", "content": user_msg}]),
+        web_search=web_search or Mock(return_value=[]),
+    )
+    handler = MessageHandler(services, callbacks, companion_plugin.WEB_SEARCH_TOOL)
+    return handler, callbacks
+
+
+def test_successful_web_search_tool_call_forces_explicit_search():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(
+            tool_calls=[ToolCall("web_search", '{"query": "DeepSeek 最新更新"}')]
+        )
+        llm.chat.return_value = "根据搜索结果，DeepSeek 最近有更新。"
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        web_search = Mock(return_value=[SearchResult(title="DeepSeek update", url="https://example.test", snippet="new")])
+        handler, _callbacks = _make_tool_handler(store, llm, web_search=web_search)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        _run(handler.process_text("查一下最近 DeepSeek 有什么更新", Event(), Bot()))
+
+        tool_call_args = llm.chat_with_tools.call_args.args
+        assert tool_call_args[4] == {"type": "function", "function": {"name": "web_search"}}
+        web_search.assert_called_once_with("DeepSeek 最新更新")
+        final_messages = llm.chat.call_args.args[0]
+        assert any(m.get("role") == "tool" and "DeepSeek update" in m.get("content", "") for m in final_messages)
+        assert store.get_recent_messages(limit=1, user_id=1)[0]["content"] == "根据搜索结果，DeepSeek 最近有更新。"
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_malformed_web_search_arguments_fall_back_to_user_message():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(tool_calls=[ToolCall("web_search", "{bad json")])
+        llm.chat.return_value = "我没有拿到明确实时结果。"
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        web_search = Mock(return_value=[])
+        handler, _callbacks = _make_tool_handler(store, llm, web_search=web_search)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        user_msg = "查一下最近 DeepSeek 有什么更新"
+        _run(handler.process_text(user_msg, Event(), Bot()))
+
+        web_search.assert_called_once_with(user_msg)
+        assert "{bad json" not in store.get_recent_messages(limit=1, user_id=1)[0]["content"]
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_unknown_tool_call_is_corrected_without_web_search():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(tool_calls=[ToolCall("calendar_create", '{"title": "会议"}')])
+        llm.chat.return_value = "我现在不能直接创建这个工具调用。"
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        web_search = Mock()
+        handler, _callbacks = _make_tool_handler(store, llm, web_search=web_search)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        _run(handler.process_text("帮我创建一个会议", Event(), Bot()))
+
+        web_search.assert_not_called()
+        final_messages = llm.chat.call_args.args[0]
+        assert not any(m.get("role") == "tool" for m in final_messages)
+        reply = store.get_recent_messages(limit=1, user_id=1)[0]["content"]
+        assert "搜索结果显示" not in reply
+        assert "我查到" not in reply
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_hallucinated_search_claim_without_tool_call_is_corrected():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(content="我查到最近版本更新了。", tool_calls=None)
+        llm.chat.return_value = "我不能确认实时信息，但可以根据已有信息说。"
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        handler, _callbacks = _make_tool_handler(store, llm)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        _run(handler.process_text("最近这个库有什么更新", Event(), Bot()))
+
+        llm.chat.assert_called_once()
+        reply = store.get_recent_messages(limit=1, user_id=1)[0]["content"]
+        assert reply == "我不能确认实时信息，但可以根据已有信息说。"
+        assert "我查到" not in reply
+        assert "搜索结果显示" not in reply
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_normal_direct_tool_enabled_answer_is_not_corrected():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(content="这个报错通常是因为依赖版本不匹配。", tool_calls=None)
+        llm.chat.return_value = "should not be used"
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        handler, _callbacks = _make_tool_handler(store, llm)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        _run(handler.process_text("帮我解释一下这个报错", Event(), Bot()))
+
+        llm.chat.assert_not_called()
+        assert store.get_recent_messages(limit=1, user_id=1)[0]["content"] == "这个报错通常是因为依赖版本不匹配。"
+    finally:
+        cleanup_store(store, db_path)
+
+
+def test_non_explicit_request_does_not_force_tool_choice():
+    store, db_path = make_store()
+    try:
+        llm = Mock()
+        llm.chat_with_tools.return_value = ToolResponse(content="这个报错通常是因为依赖版本不匹配。", tool_calls=None)
+        llm.complete_if_needed.side_effect = lambda messages, reply, max_tokens=256: reply
+        handler, _callbacks = _make_tool_handler(store, llm)
+
+        class Event:
+            user_id = 1
+
+        class Bot:
+            pass
+
+        _run(handler.process_text("帮我解释一下这个报错", Event(), Bot()))
+
+        assert llm.chat_with_tools.call_args.args[4] is None
     finally:
         cleanup_store(store, db_path)
 

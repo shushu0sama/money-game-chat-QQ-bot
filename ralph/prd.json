@@ -1,0 +1,359 @@
+{
+  "project": "QQ Chat Bot",
+  "branchName": "ralph/langgraph-rearchitecture",
+  "description": "QQ Chat Bot LangGraph 新架构改造：将 bot 核心从简易线性架构重建为基于 LangGraph 的智能体架构，nonebot 保留为 QQ 适配层，核心智能行为迁移到可测试、可扩展的 graph 中。",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add LangGraph dependency and architecture package skeleton",
+      "description": "As a developer, I need the project to contain the new LangGraph architecture package skeleton so future work has stable module boundaries.",
+      "acceptanceCriteria": [
+        "Add LangGraph dependency to the project dependency configuration",
+        "Create package directories or modules for adapters, graphs, state, nodes, tools, memory, and prompts under the existing plugin package",
+        "Each new package module imports successfully in tests",
+        "Do not change the active nonebot message handling behavior in this story",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "MVP foundation. This story only creates dependency and module skeleton, not graph behavior."
+    },
+    {
+      "id": "US-002",
+      "title": "Define normalized bot input and output models",
+      "description": "As a developer, I need nonebot-independent input and output models so graph code does not depend on raw QQ event objects.",
+      "acceptanceCriteria": [
+        "Define a normalized inbound message model with user id, group id if present, message text, timestamp, and source metadata fields",
+        "Define a graph output model with should_reply, reply_text, action list, and diagnostics fields",
+        "Models do not import nonebot event classes",
+        "Add tests that instantiate inbound message and output models without starting nonebot",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Keeps the adapter boundary explicit before building graph state."
+    },
+    {
+      "id": "US-003",
+      "title": "Define core LangGraph state model",
+      "description": "As a developer, I need a typed graph state model so every graph node reads and writes predictable fields.",
+      "acceptanceCriteria": [
+        "Define graph state fields for inbound message, recent context, memory results, intent classification, tool plan, reply policy, generated response, tool results, and diagnostics",
+        "Graph state supports normal message handling and future proactive triggers without raw nonebot objects",
+        "Provide a function to initialize graph state from the normalized inbound message model",
+        "Add tests for graph state initialization from a normalized message",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Depends on US-002 models."
+    },
+    {
+      "id": "US-004",
+      "title": "Add graph diagnostics model and helpers",
+      "description": "As a developer, I need graph execution diagnostics so strange bot behavior can be traced by node and decision.",
+      "acceptanceCriteria": [
+        "Define a diagnostics structure containing run id, visited nodes, decisions, selected tool plan summary, final reply policy, and error summary",
+        "Add helper functions to append visited nodes and decision records to graph state",
+        "Diagnostics helpers avoid logging secrets and do not require full raw user content",
+        "Add tests that verify diagnostics are attached and updated during a fake graph run",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "Useful before implementing real nodes so every later story can report decisions."
+    },
+    {
+      "id": "US-005",
+      "title": "Implement input normalization node",
+      "description": "As a developer, I need an input normalization node so graph execution starts with a clean message representation.",
+      "acceptanceCriteria": [
+        "Implement a node that validates and normalizes the inbound message fields already present in graph state",
+        "Node records its visit in diagnostics",
+        "Node returns updated graph state without calling LLMs or tools",
+        "Add tests for direct message text and group message metadata normalization",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "Small deterministic graph node."
+    },
+    {
+      "id": "US-006",
+      "title": "Implement context loading node with fake provider support",
+      "description": "As a developer, I need a context loading node that can be tested with a fake provider before real memory migration.",
+      "acceptanceCriteria": [
+        "Define a context provider protocol or interface for recent conversation context",
+        "Implement a context loading node that writes recent context into graph state",
+        "Node supports a fake context provider in tests",
+        "Node records loaded context summary in diagnostics without storing full sensitive content",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "MVP context only. Durable memory migration is later."
+    },
+    {
+      "id": "US-007",
+      "title": "Implement deterministic reply decision node",
+      "description": "As a bot maintainer, I need an initial reply decision node so the graph can explicitly choose reply, no reply, clarification, or tool route.",
+      "acceptanceCriteria": [
+        "Define reply decision values for reply_now, no_reply, ask_clarification, and tool_needed",
+        "Implement a deterministic rule-based decision node using normalized message and context fields",
+        "Node writes a typed reply policy into graph state",
+        "Tests cover direct mention, casual message, ambiguous request, and tool-like request",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "Use deterministic rules first so MVP graph is testable without LLM nondeterminism."
+    },
+    {
+      "id": "US-008",
+      "title": "Implement prompt builder for response generation",
+      "description": "As a developer, I need prompt construction isolated from the graph node so response generation inputs can be unit tested.",
+      "acceptanceCriteria": [
+        "Create a prompt builder that consumes graph state fields instead of raw nonebot events",
+        "Prompt builder includes normalized user message, recent context, reply policy, memory summary if present, and tool result summary if present",
+        "Prompt builder excludes unavailable optional fields instead of inserting placeholder noise",
+        "Add tests for normal reply, clarification prompt, and tool-result prompt inputs",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "Prepares response node without touching the active LLM client yet."
+    },
+    {
+      "id": "US-009",
+      "title": "Implement response generation node with injectable LLM client",
+      "description": "As a QQ user, I want graph responses to be generated through a node that can use the existing LLM client while remaining testable.",
+      "acceptanceCriteria": [
+        "Define an LLM client protocol or adapter used by the response generation node",
+        "Implement response generation node for normal reply and clarification modes",
+        "Node writes generated response text into graph state",
+        "Tests use a fake LLM client and verify prompt input and generated response output",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": "Tool-result response mode can be expanded after tool execution exists."
+    },
+    {
+      "id": "US-010",
+      "title": "Build MVP message graph",
+      "description": "As a bot maintainer, I need a minimal LangGraph message graph so a normalized message flows through structured nodes and returns a structured output.",
+      "acceptanceCriteria": [
+        "Implement graph builder for the MVP message graph",
+        "Graph includes input normalization, context loading, reply decision, response generation, and output finalization nodes",
+        "Graph can be invoked from a Python test without starting nonebot",
+        "Graph returns should_reply=false when reply policy is no_reply and should_reply=true with text when a reply is generated",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": "Combines earlier MVP nodes into a runnable graph."
+    },
+    {
+      "id": "US-011",
+      "title": "Add nonebot event adapter for graph input",
+      "description": "As a developer, I need a nonebot adapter that converts QQ events into normalized graph input so handler code stays thin.",
+      "acceptanceCriteria": [
+        "Implement adapter function that converts supported nonebot message events into the normalized inbound message model",
+        "Adapter extracts user id, group id when present, message text, timestamp if available, and source metadata",
+        "Adapter is the only new code in this story allowed to reference nonebot event classes",
+        "Add tests with fake or mocked event objects for private and group message inputs",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": "Prepares integration without switching active handler yet."
+    },
+    {
+      "id": "US-012",
+      "title": "Integrate active message handler with MVP graph",
+      "description": "As a QQ user, I want incoming messages to be processed through the LangGraph MVP path while preserving basic direct chat behavior.",
+      "acceptanceCriteria": [
+        "Update the active nonebot message handler to call the event adapter and MVP message graph",
+        "Handler sends a QQ reply only when graph output should_reply is true and reply_text is non-empty",
+        "Handler logs graph diagnostics on errors without sending internal traces to QQ users",
+        "Existing basic direct chat tests are updated or preserved to validate the new path",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": "This is the MVP cutover point for basic message handling."
+    },
+    {
+      "id": "US-013",
+      "title": "Define memory retrieval contract",
+      "description": "As a developer, I need a structured memory retrieval contract so memory can move into graph nodes without exposing old internals.",
+      "acceptanceCriteria": [
+        "Define memory provider interface with inputs from graph state and structured memory output",
+        "Structured output distinguishes recent context, durable user facts, user preferences, and candidate topic continuations",
+        "Add fake memory provider for tests",
+        "Add tests for empty memory and populated memory output",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": "Phase 2 memory foundation."
+    },
+    {
+      "id": "US-014",
+      "title": "Implement memory retrieval node",
+      "description": "As a QQ user, I want relevant memory to be retrieved into graph state so replies can use conversation continuity.",
+      "acceptanceCriteria": [
+        "Implement memory retrieval node using the memory provider contract",
+        "Node writes structured memory output into graph state",
+        "Node can initially wrap existing memory logic through an adapter if available",
+        "Tests run with the fake memory provider and verify graph state updates",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": "Depends on US-013."
+    },
+    {
+      "id": "US-015",
+      "title": "Define tool registry and tool plan models",
+      "description": "As a bot maintainer, I need a tool registry and tool plan model so tools can be added without editing the main message handler.",
+      "acceptanceCriteria": [
+        "Define tool descriptor fields for name, description, argument schema, confirmation requirement, and executor reference",
+        "Define tool plan fields for tool name, arguments, confidence, confirmation requirement, and rejection reason when no tool fits",
+        "Implement a registry that can register and retrieve tool descriptors by name",
+        "Add tests for registering a fake tool and retrieving its descriptor",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": "Phase 2 tool foundation."
+    },
+    {
+      "id": "US-016",
+      "title": "Implement tool routing node with fake tools",
+      "description": "As a bot maintainer, I need tool routing represented as graph logic so the graph can plan tool use before execution.",
+      "acceptanceCriteria": [
+        "Implement tool routing node that reads graph state and available tool registry entries",
+        "Node writes a structured tool plan instead of executing the tool directly",
+        "Tests cover routing to one fake tool from a tool-like request",
+        "Tests cover producing no tool plan when no registered tool fits",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": "Can start deterministic and later become LLM-assisted."
+    },
+    {
+      "id": "US-017",
+      "title": "Implement tool execution node with fake executor",
+      "description": "As a QQ user, I want planned tools to execute through graph state so tool results can be included in the final reply.",
+      "acceptanceCriteria": [
+        "Implement tool execution node that reads a confirmed tool plan and calls the matching registered executor",
+        "Node writes tool execution result or error summary into graph state",
+        "Node does not execute tools when no tool plan exists or confirmation is required but missing",
+        "Tests cover successful fake tool execution and skipped execution",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": "Completes generic tool pipeline before migrating real tools."
+    },
+    {
+      "id": "US-018",
+      "title": "Migrate one existing tool end-to-end",
+      "description": "As a QQ user, I want at least one existing tool capability to work through the LangGraph tool pipeline so the migration pattern is proven.",
+      "acceptanceCriteria": [
+        "Inventory existing tool-like functions and select one low-risk tool for first migration",
+        "Register the selected existing tool in the graph tool registry",
+        "Add a regression test where a message routes to the selected tool, executes it, and includes its result in graph state",
+        "Existing direct behavior for the selected tool is preserved or intentionally replaced by the graph path",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": "Do only one real tool first to avoid a too-large Ralph iteration."
+    },
+    {
+      "id": "US-019",
+      "title": "Define proactive graph state and output models",
+      "description": "As a developer, I need proactive behavior models so scheduled or background checks do not reuse normal message state incorrectly.",
+      "acceptanceCriteria": [
+        "Define proactive trigger input fields for trigger reason, target user, current time, and source metadata",
+        "Define proactive state fields for user context, recent interaction state, candidate action, final decision, and diagnostics",
+        "Define proactive output model with action type, should_send, message text if any, and diagnostics",
+        "Add tests for initializing proactive state from a trigger input",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": "Phase 3 proactive foundation."
+    },
+    {
+      "id": "US-020",
+      "title": "Build conservative proactive graph skeleton",
+      "description": "As a bot maintainer, I need a proactive graph entrypoint that safely decides no-op by default before active messaging becomes smarter.",
+      "acceptanceCriteria": [
+        "Implement proactive graph builder with trigger normalization, context loading, proactive decision, and output finalization nodes",
+        "Default proactive decision returns should_send=false unless explicit test conditions allow a message",
+        "Graph does not directly send QQ messages and only returns an action for adapters to execute",
+        "Tests verify no-op behavior for a default scheduled trigger",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": "Keeps proactive behavior conservative and separate from message handling."
+    },
+    {
+      "id": "US-021",
+      "title": "Inventory old linear orchestration paths",
+      "description": "As a maintainer, I need a clear inventory of old orchestration code so replaced paths can be retired safely.",
+      "acceptanceCriteria": [
+        "List old modules and functions that perform message orchestration, memory orchestration, tool routing, response generation, and proactive behavior",
+        "Mark each old path as keep adapter, wrap temporarily, replace with graph, or remove later",
+        "Add notes in an implementation-facing file or test fixture that Ralph can use for later retirement stories",
+        "No behavior changes are made in this inventory story",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": "Prepares safe retirement without deleting code blindly."
+    },
+    {
+      "id": "US-022",
+      "title": "Retire replaced message orchestration path",
+      "description": "As a maintainer, I want old message orchestration reduced or removed after the LangGraph path is active so future behavior is not split across two systems.",
+      "acceptanceCriteria": [
+        "Identify old message orchestration code already replaced by the active LangGraph message handler",
+        "Remove obsolete code or isolate it behind compatibility adapters only where still required",
+        "Tests verify the active handler uses the LangGraph path for normal direct messages",
+        "No remaining active direct message path bypasses the MVP graph for basic chat handling",
+        "Typecheck passes",
+        "Tests pass"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": "Do after MVP cutover and inventory."
+    }
+  ]
+}

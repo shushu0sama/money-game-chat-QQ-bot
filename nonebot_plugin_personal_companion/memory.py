@@ -31,6 +31,7 @@ class MemoryStore:
     }
     FRESH_MEMORY_WINDOW_DAYS = 2
     SUMMARY_RECALL_WINDOW_DAYS = 7
+    RECENT_TIMELINE_WINDOW_DAYS = 7
     RELATIVE_DATE_OFFSETS = {"前天": -2, "昨天": -1, "今天": 0, "今晚": 0, "明天": 1, "后天": 2}
 
     def __init__(self, db_path: Path | str):
@@ -482,25 +483,30 @@ class MemoryStore:
         return [self._timeline_row(r) for r in rows]
 
     def get_recent_timeline_entries(self, user_id: int, limit: int = 5) -> list[dict]:
+        cutoff = (datetime.now(BEIJING_TZ).date() - timedelta(days=self.RECENT_TIMELINE_WINDOW_DAYS)).strftime("%Y-%m-%d")
         with self._get_conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM memory_timeline
                    WHERE user_id = ?
+                     AND status IN ('planned', 'ongoing')
+                     AND event_date >= ?
                    ORDER BY event_date DESC, id DESC LIMIT ?""",
-                (user_id, limit),
+                (user_id, cutoff, limit),
             ).fetchall()
         return [self._timeline_row(r) for r in rows]
 
-    def retrieve_timeline_entries(self, keywords: list[str], user_id: int, limit: int = 5) -> list[dict]:
+    def retrieve_timeline_entries(self, keywords: list[str], user_id: int, limit: int = 5, include_history: bool = False) -> list[dict]:
         if not keywords:
             return []
         results: dict[int, tuple[sqlite3.Row, float]] = {}
+        statuses = ("planned", "ongoing") if not include_history else ("planned", "ongoing", "done", "cancelled", "expired")
+        placeholders = ",".join("?" for _ in statuses)
         with self._get_conn() as conn:
             for kw in keywords:
                 rows = conn.execute(
-                    """SELECT * FROM memory_timeline
-                       WHERE user_id = ? AND status != 'suppressed' AND (content LIKE ? OR tags LIKE ?)""",
-                    (user_id, f"%{kw}%", f"%{kw}%"),
+                    f"""SELECT * FROM memory_timeline
+                       WHERE user_id = ? AND status IN ({placeholders}) AND (content LIKE ? OR tags LIKE ?)""",
+                    tuple([user_id, *statuses, f"%{kw}%", f"%{kw}%"]),
                 ).fetchall()
                 for row in rows:
                     score = 1.0 + (row["importance"] or 1) * 0.5 + min((row["access_count"] or 0) * 0.1, 1.5)

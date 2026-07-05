@@ -420,8 +420,8 @@ class TestTimeline:
         store.add_timeline_entry(1, "2026-04-23", "用户调试项目报错", tags=["项目"])
         store.add_timeline_entry(2, "2026-04-22", "另一个用户拥有幸福", tags=["名场面"])
 
-        by_content = store.retrieve_timeline_entries(["幸福"], user_id=1, limit=5)
-        by_tag = store.retrieve_timeline_entries(["项目"], user_id=1, limit=5)
+        by_content = store.retrieve_timeline_entries(["幸福"], user_id=1, limit=5, include_history=True)
+        by_tag = store.retrieve_timeline_entries(["项目"], user_id=1, limit=5, include_history=True)
 
         assert len(by_content) == 1
         assert by_content[0]["content"] == "用户宣布自己已经拥有幸福了"

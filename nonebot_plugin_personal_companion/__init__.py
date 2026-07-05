@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from nonebot import on_message, get_driver
-from nonebot.adapters.onebot.v11 import Bot, Event, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, PrivateMessageEvent
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 
@@ -60,6 +60,8 @@ from .prompt_builder import (
 from .message_handler import MessageHandler, MessageHandlerCallbacks
 from .reminders import ReminderService
 from .services import AppServices
+from .adapters import event_to_inbound_message
+from .graphs import invoke_message_graph
 
 __plugin_meta__ = PluginMetadata(
     name="personal_companion",
@@ -207,6 +209,14 @@ async def _send_private_reply(bot: Bot, user_id: int, text: str) -> int:
     return await _send_chunks(lambda chunk: bot.send_private_msg(user_id=user_id, message=chunk), text)
 
 
+class _GraphLLMAdapter:
+    def __init__(self, client: LLMClient):
+        self.client = client
+
+    def generate_response(self, messages: list[dict[str, str]]) -> str | None:
+        return self.client.chat(messages, 3, 1024)
+
+
 @private_msg.handle()
 async def handle_private_message(bot: Bot, event: PrivateMessageEvent):
     global memory_store, llm, plugin_config, flow_manager
@@ -325,6 +335,22 @@ async def _process_text_message(user_msg: str, event, bot):
     """Handle a regular text message (extracted from main handler for reuse)."""
     global memory_store, llm, plugin_config
     assert memory_store is not None and llm is not None and plugin_config is not None
+
+    if isinstance(event, (PrivateMessageEvent, GroupMessageEvent)):
+        inbound = event_to_inbound_message(event)
+        graph_output = await asyncio.to_thread(invoke_message_graph, inbound, _GraphLLMAdapter(llm))
+        if graph_output.should_reply and graph_output.reply_text:
+            memory_store.save_message("user", user_msg, event.user_id)
+            memory_store.save_message("assistant", graph_output.reply_text, event.user_id)
+            await _send_event_reply(bot, event, graph_output.reply_text)
+            await _maybe_extract_memories(event.user_id)
+            return
+
+        if graph_output.diagnostics.decisions and any("reply_decision:tool_needed" in item for item in graph_output.diagnostics.decisions):
+            logger.info(f"LangGraph routed to tool-needed path; falling back to legacy handler. run_id={graph_output.diagnostics.run_id}")
+        else:
+            memory_store.save_message("user", user_msg, event.user_id)
+            return
     services = app_services or AppServices(
         config=plugin_config,
         memory=memory_store,
@@ -351,6 +377,7 @@ async def _process_text_message(user_msg: str, event, bot):
         strip_outgoing_speaker_prefix=_strip_outgoing_speaker_prefix,
         maybe_snooze_proactive_for_user_message=_maybe_snooze_proactive_for_user_message,
         build_messages=_build_messages,
+        web_search=search_web,
     )
     await MessageHandler(services, callbacks, WEB_SEARCH_TOOL).process_text(user_msg, event, bot)
 
@@ -599,7 +626,8 @@ def _retrieve_timeline_for_turn(user_msg: str, keywords: list[str], user_id: int
     for date_str in _extract_timeline_query_dates(user_msg):
         by_date.extend(memory_store.get_timeline_entries_between(user_id, date_str, date_str, limit=8))
 
-    by_keyword = memory_store.retrieve_timeline_entries(keywords, user_id, limit=4)
+    include_history = bool(by_date)
+    by_keyword = memory_store.retrieve_timeline_entries(keywords, user_id, limit=4, include_history=include_history)
     seen: set[int] = set()
     merged: list[dict] = []
     for entry in by_date + by_keyword:

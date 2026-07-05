@@ -123,18 +123,22 @@ class LLMClient:
         return reply + continuation
 
     def chat_with_tools(self, messages: Any, tools: Any,
-                        max_retries: int = 2, max_tokens: int = 1024):
+                        max_retries: int = 2, max_tokens: int = 1024,
+                        tool_choice: Any | None = None):
         """Send a chat request with tool definitions. Returns the raw response
         so the caller can inspect tool_calls. On failure, returns None."""
         for attempt in range(max_retries):
             try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=0.8,
-                    max_tokens=max_tokens,
-                )
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tools,
+                    "temperature": 0.8,
+                    "max_tokens": max_tokens,
+                }
+                if tool_choice is not None:
+                    kwargs["tool_choice"] = tool_choice
+                return self.client.chat.completions.create(**kwargs)
             except Exception:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)

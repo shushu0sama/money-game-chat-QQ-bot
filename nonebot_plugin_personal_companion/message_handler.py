@@ -18,7 +18,7 @@ from .feishu_calendar import (
 from .llm_client import LLMClient
 from .services import AppServices
 from .turn_context import analyze_turn, choose_reply_max_tokens, detect_emotions
-from .web_search import format_search_results, search_web
+from .web_search import format_search_results
 
 
 class EventLike(Protocol):
@@ -35,7 +35,41 @@ FallbackProvider = Callable[[int | None], str]
 SpeakerPrefixStripper = Callable[[str], str]
 SnoozeUpdater = Callable[[int, str], None]
 MessageBuilder = Callable[[str, list[str], int, list[str] | None, object, list[dict] | None], list[dict]]
+WebSearchProvider = Callable[[str], list]
 
+
+EXPLICIT_SEARCH_MARKERS = (
+    "查一下", "搜一下", "搜索", "帮我查", "帮我搜", "查查", "搜搜",
+    "最新", "最近", "现在", "实时", "今天", "新闻", "价格", "版本",
+)
+
+FALSE_SEARCH_CLAIM_PATTERNS = (
+    "我查到", "我搜索到", "我搜到", "根据搜索结果", "搜索结果显示", "我刚查", "查了一下",
+)
+
+
+def _should_force_web_search(user_msg: str) -> bool:
+    return any(marker in user_msg for marker in EXPLICIT_SEARCH_MARKERS)
+
+
+def _claims_search_without_tool(reply: str) -> bool:
+    return any(pattern in reply for pattern in FALSE_SEARCH_CLAIM_PATTERNS)
+
+
+def _extract_web_search_query(arguments: str | None, user_msg: str) -> str:
+    try:
+        args = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        logger.warning("Malformed web_search arguments", exc_info=True)
+        return user_msg
+
+    if not isinstance(args, dict):
+        return user_msg
+
+    query = args.get("query")
+    if isinstance(query, str) and query.strip():
+        return query.strip()
+    return user_msg
 
 @dataclass
 class MessageHandlerCallbacks:
@@ -50,6 +84,7 @@ class MessageHandlerCallbacks:
     strip_outgoing_speaker_prefix: SpeakerPrefixStripper
     maybe_snooze_proactive_for_user_message: SnoozeUpdater
     build_messages: MessageBuilder
+    web_search: WebSearchProvider
 
 
 class MessageHandler:
@@ -164,13 +199,36 @@ class MessageHandler:
     async def _call_llm(self, user_msg: str, user_id: int, messages: list[dict], turn_ctx, max_tokens: int, llm: LLMClient, web_search_enabled: bool) -> str:
         if web_search_enabled and turn_ctx.allow_web_search:
             try:
-                response = await asyncio.to_thread(llm.chat_with_tools, messages, [self.web_search_tool])
+                tool_choice = None
+                if _should_force_web_search(user_msg):
+                    tool_choice = {"type": "function", "function": {"name": "web_search"}}
+                response = await asyncio.to_thread(
+                    llm.chat_with_tools,
+                    messages,
+                    [self.web_search_tool],
+                    2,
+                    max_tokens,
+                    tool_choice,
+                )
                 if response is None:
                     return await asyncio.to_thread(llm.chat, messages, 3, max_tokens) or self.callbacks.llm_fallback(user_id)
 
                 choice = response.choices[0]
                 msg = choice.message
-                if msg.tool_calls:
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if tool_calls:
+                    supported_tool_calls = [tc for tc in tool_calls if tc.function.name == "web_search"]
+                    if not supported_tool_calls:
+                        corrected_messages = messages + [{
+                            "role": "user",
+                            "content": (
+                                "刚才请求了不支持的工具。当前只能使用 web_search 工具；"
+                                "请不要声称已经调用工具，直接基于已有信息回答。"
+                                "如果需要实时信息，请说明暂时无法确认。"
+                            ),
+                        }]
+                        return await asyncio.to_thread(llm.chat, corrected_messages, 3, max_tokens) or self.callbacks.llm_fallback(user_id)
+
                     assistant_msg = {
                         "role": "assistant",
                         "tool_calls": [
@@ -182,7 +240,7 @@ class MessageHandler:
                                     "arguments": tc.function.arguments,
                                 },
                             }
-                            for tc in msg.tool_calls
+                            for tc in supported_tool_calls
                         ],
                         "content": msg.content or "",
                     }
@@ -191,20 +249,42 @@ class MessageHandler:
                         assistant_msg["reasoning_content"] = rc
                     messages.append(assistant_msg)
 
-                    for tc in msg.tool_calls:
-                        if tc.function.name == "web_search":
-                            try:
-                                args = json.loads(tc.function.arguments)
-                                query = args.get("query", user_msg)
-                                results = await asyncio.to_thread(search_web, query)
-                                formatted = format_search_results(results, query)
-                            except Exception as e:
-                                logger.warning(f"Search error: {e}")
-                                formatted = f"搜索「{tc.function.arguments}」时出错，请根据已有知识回答。"
-                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": formatted})
+                    for tc in supported_tool_calls:
+                        query = _extract_web_search_query(tc.function.arguments, user_msg)
+                        try:
+                            results = await asyncio.to_thread(self.callbacks.web_search, query)
+                            formatted = format_search_results(results, query)
+                        except Exception:
+                            logger.warning("Search error", exc_info=True)
+                            formatted = (
+                                f"搜索「{query}」时出错。请不要声称已经查到实时结果；"
+                                "可以基于已有知识回答，并说明未能获取可靠实时信息。"
+                            )
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": formatted})
+
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "请基于上面的工具结果回答。只有当工具结果确实支持时，才可以说“查到/搜索结果”。"
+                            "如果结果为空或失败，请说明没有拿到可靠实时结果。"
+                        ),
+                    })
                     return await asyncio.to_thread(llm.chat, messages, 3, max(1024, max_tokens)) or self.callbacks.llm_fallback(user_id)
 
                 reply = msg.content or ""
+                if _claims_search_without_tool(reply):
+                    corrected_messages = messages + [
+                        {"role": "assistant", "content": reply},
+                        {
+                            "role": "user",
+                            "content": (
+                                "你刚才没有实际调用搜索工具。请重新回答：不要说“我查到/搜索结果显示/我搜到”，"
+                                "除非你确实收到了工具结果；如果需要实时信息但没有搜索结果，请明确说明无法确认实时信息。"
+                            ),
+                        },
+                    ]
+                    return await asyncio.to_thread(llm.chat, corrected_messages, 3, max_tokens) or self.callbacks.llm_fallback(user_id)
+
                 if choice.finish_reason == "length":
                     messages.append({"role": "assistant", "content": reply})
                     messages.append({
